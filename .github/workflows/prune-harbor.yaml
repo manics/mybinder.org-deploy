@@ -12,6 +12,7 @@ concurrency: prune-harbor
 jobs:
   prune-harbor:
     name: Prune ${{ matrix.name }} harbor registry
+    if: github.repository == 'jupyterhub/mybinder.org-deploy'
     runs-on: ubuntu-22.04
 
     strategy:
