@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -210,7 +208,8 @@ def deploy(
                 f"binderhub.jupyterhub.ingress.hosts={{jupyterhub.mybinder.{ip_address}.nip.io}}",
                 "--set",
                 f"static.ingress.hosts={{static.{ip_address}.nip.io}}",
-            ].extend(additional_helm_args)
+            ]
+            + additional_helm_args
         )
 
     check_call(helm, dry_run)
@@ -451,6 +450,7 @@ def main():
     argparser.add_argument(
         "--additional-helm-args",
         action="append",
+        default=[],
         help="Additional argument for Helm. For example, '--additional-helm-args=--set=ingress-nginx.enabled=false' to disable the installation of ingress-nginx.",
     )
 
@@ -475,20 +475,12 @@ def main():
                 "You do not seem to be running on CI but have not set the --local flag."
             )
 
-            # Use regex to match user input
-            regex_no = re.compile("^[n|N][o|O]$")
-            regex_yes = re.compile("^[y|Y][e|E][s|S]$")
             response = input("Are you sure you want to execute this script? [yes/no]: ")
 
-            if regex_no.match(response):
-                # User isn't sure - exit script
+            if response.lower() == "no":
                 print("Exiting script.")
                 sys.exit()
-            elif regex_yes.match(response):
-                # User is sure - proceed
-                pass
-            else:
-                # User wrote something that wasn't "yes" or "no"
+            elif response.lower() != "yes":
                 raise ValueError("Unrecognised input. Expecting either yes or no.")
 
         # script is running on CI, proceed with auth and helm setup
