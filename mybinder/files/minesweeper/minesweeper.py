@@ -75,6 +75,8 @@ default_config = {
     ],
     # 8 hour max age, cleanup after culler
     "pod_max_age_seconds": 0,
+    # Limit CPU to this value in millicores
+    "cpu_throttle_millicores": 100,
 }
 
 default_config.update(herorat.default_config)
@@ -93,14 +95,16 @@ def get_kube():
 class Proc(dict):
     """Proc is a dict subclass with attribute-access for keys
 
-    suspicious and should_terminate are added via inspection.
+    suspicious, should_terminate and should_throttle
+    are added via inspection.
     They can be booleans or truthy strings explaining
-    why they are suspicious or should be terminated.
+    why they are suspicious or should be terminated/throttled.
     """
 
     def __init__(self, **kwargs):
         kwargs.setdefault("suspicious", False)
         kwargs.setdefault("should_terminate", False)
+        kwargs.setdefault("should_throttle", False)
         super().__init__(**kwargs)
 
         # secondary derived fields
@@ -118,6 +122,7 @@ class Proc(dict):
                     "status",
                     "suspicious",
                     "should_terminate",
+                    "should_throttle",
                     "cmd",
                 ]
                 if self.get(key) is not None
@@ -311,20 +316,76 @@ async def report_pod(pod):
     )
 
 
-def terminate_pod(pod):
+# CPU can be in millicores (suffix m), or whole cores (no suffix)
+def _to_millicores(s):
+    if isinstance(s, str) and s.endswith("m"):
+        return int(s[:-1])
+    else:
+        return int(1000 * float(s))
+
+
+def throttle_pod_cpu_limit(pod, cpu_millicores):
+    # https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/
+    #
+    # Changing resources is not possible for the "BestEffort" Pod QOS Class
+    # which applies if no resources limits are defined
+    #
+    # "Guaranteed" QOS class applies if cpu-request=cpu-limit and
+    # memory-request=memory-limit
+    #
+    # For all other cases the "Burstable" class applies
+    #
+    # To keep things simple only handle the Burstable class
+
+    qosClass = pod["status"]["qosClass"]
+    if qosClass != "Burstable":
+        raise ValueError(f"Pod QOS class {qosClass} not supported")
+
+    patch = {"spec": {"containers": []}}
+    namespace = pod["metadata"]["namespace"]
+    name = pod["metadata"]["name"]
+
+    for container in pod["spec"]["containers"]:
+        patch_resources = {}
+        resources = container["resources"]
+        cpu_limit = _to_millicores(resources.get("limits", {}).get("cpu", 0))
+        cpu_request = _to_millicores(resources.get("requests", {}).get("cpu", 0))
+        if cpu_request and cpu_request > cpu_millicores:
+            patch_resources["requests"] = {"cpu": f"{cpu_millicores}m"}
+        if not cpu_limit or cpu_limit > cpu_millicores:
+            patch_resources["limits"] = {"cpu": f"{cpu_millicores}m"}
+        if patch_resources:
+            patch["spec"]["containers"].append(
+                {"name": container["name"], "resources": patch_resources}
+            )
+
+    if patch["spec"]["containers"]:
+        kube = get_kube()
+        print(f"Patch {json.dumps(patch)}")
+        kube.patch_namespaced_pod_resize(
+            name=name,
+            namespace=namespace,
+            body=patch,
+        )
+        print(f"Updated pod {name} cpu limit {cpu_millicores}m")
+
+
+def terminate_or_throttle_pod(pod, action):
     """Call in a thread to terminate a pod"""
     namespace = pod["metadata"]["namespace"]
     name = pod["metadata"]["name"]
     # Log just enough information to be useful for remote alerting
     message = {
-        "action": "delete",
+        "action": action,
         "pod": name,
         "env": {},
         "minesweeper": {k: v for k, v in pod["minesweeper"].items() if k != "procs"},
     }
     # Only include interesting procs, the full list is too long for alerts
     message["minesweeper"]["procs"] = [
-        p for p in pod["minesweeper"]["procs"] if p.suspicious or p.should_terminate
+        p
+        for p in pod["minesweeper"]["procs"]
+        if p.suspicious or p.should_terminate or p.should_throttle
     ]
     # These pod env vars let us link the pod to the Binder request
     for container in pod["spec"]["containers"]:
@@ -334,9 +395,20 @@ def terminate_pod(pod):
                 and envvar["value"]
             ):
                 message["env"][envvar["name"]] = envvar["value"]
-    print(json.dumps(message))
-    kube = get_kube()
-    kube.delete_namespaced_pod(name=name, namespace=namespace)
+
+    if action == "throttle":
+        print(json.dumps(message))
+        try:
+            throttle_pod_cpu_limit(pod, config["cpu_throttle_millicores"])
+        except Exception as e:
+            print(f"Failed to throttle pod: {e}")
+            action = "delete"
+            message["action"] = action
+
+    if action == "delete":
+        print(json.dumps(message))
+        kube = get_kube()
+        kube.delete_namespaced_pod(name=name, namespace=namespace)
 
 
 async def node_report(pods=None, userid=1000):
@@ -402,14 +474,15 @@ async def node_report(pods=None, userid=1000):
         await asyncio.gather(*report_futures)
 
     # finally, terminate pods that meet the immediate termination condition
-    pods_to_terminate = [
-        pod for pod in pods.values() if pod["minesweeper"]["should_terminate"]
-    ]
-    if pods_to_terminate:
-        terminate_futures = [
-            in_pool(partial(terminate_pod, pod)) for pod in pods_to_terminate
-        ]
-        await asyncio.gather(*terminate_futures)
+    futures = []
+    for pod in pods.values():
+        if pod["minesweeper"]["should_terminate"]:
+            futures.append(in_pool(partial(terminate_or_throttle_pod, pod, "delete")))
+        elif pod["minesweeper"]["should_throttle"]:
+            futures.append(in_pool(partial(terminate_or_throttle_pod, pod, "throttle")))
+
+    if futures:
+        await asyncio.gather(*futures)
 
 
 def get_pool(n=None):
